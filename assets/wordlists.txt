@@ -1,0 +1,1 @@
+https://gitlab.com/kalilinux/packages/wordlists/-/blob/kali/master/rockyou.txt.gz?ref_type=heads

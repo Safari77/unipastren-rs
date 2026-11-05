@@ -1,0 +1,7 @@
+/Cargo.lock
+*~
+.*.sw?
+/target/
+tags
+/perf.data
+/perf.data.old

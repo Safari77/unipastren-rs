@@ -1,0 +1,65 @@
+[package]
+name = "unipastren"
+version = "0.2.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+authors = ["Sami Farin"]
+description = "Universal UTF-8 Password & Passphrase Strength Evaluator with user-defined dictionaries"
+
+[dependencies]
+aho-corasick = "1.1"
+clap = { version = "4.6", features = ["derive"] }
+fst = "0.4"
+unicode-normalization = "0.1"
+unicode-script = "0.5"
+unicode-segmentation = "1.13"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
+rpassword = "7.5"
+
+[dev-dependencies]
+criterion = "0.8"
+clap = { version = "4.6", features = ["derive"] }
+
+[build-dependencies]
+fst = "0.4"
+unicode-normalization = "0.1"
+rayon = "1.12"
+
+[profile.release]
+opt-level = 3
+lto = "off"
+debug = true
+strip = false
+panic = "abort"
+#lto = "thin"
+#codegen-units = 1
+
+[profile.dev.build-override]
+opt-level = 3
+
+[[bench]]
+name = "bench"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
+exit = "deny"
+mem_forget = "deny"
+large_futures = "warn"
