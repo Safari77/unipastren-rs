@@ -379,3 +379,74 @@ fn test_multirrow_qwerty_diagonal_walks() {
     );
     assert_eq!(res.rating, StrengthRating::VeryWeak);
 }
+
+#[cfg(test)]
+mod strength_rating_tests {
+    use crate::{ParseStrengthRatingError, StrengthRating};
+
+    #[test]
+    fn test_as_str_and_display() {
+        let cases = [
+            (StrengthRating::VeryWeak, "Very Weak"),
+            (StrengthRating::Weak, "Weak"),
+            (StrengthRating::Reasonable, "Reasonable"),
+            (StrengthRating::Strong, "Strong"),
+            (StrengthRating::Cryptographic, "Cryptographic"),
+        ];
+
+        for (rating, expected) in cases {
+            assert_eq!(rating.as_str(), expected);
+            assert_eq!(rating.to_string(), expected);
+            assert_eq!(rating.as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn test_from_str_and_from_text_valid_variations() {
+        let test_cases = [
+            // VeryWeak variations
+            ("WEAK", StrengthRating::Weak),
+            ("very_weak", StrengthRating::VeryWeak),
+            ("rEaSoNaBlE", StrengthRating::Reasonable),
+        ];
+
+        for (input, expected) in test_cases {
+            assert_eq!(
+                input.parse::<StrengthRating>(),
+                Ok(expected),
+                "Failed to parse via FromStr: {input:?}"
+            );
+            assert_eq!(
+                StrengthRating::from_text(input),
+                Some(expected),
+                "Failed to parse via from_text: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_str_and_from_text_invalid() {
+        let invalid_inputs = ["", "very weak extra", "cryptographicalllllllllllllllllllllll"];
+
+        for input in invalid_inputs {
+            assert_eq!(
+                input.parse::<StrengthRating>(),
+                Err(ParseStrengthRatingError),
+                "Expected parse error for: {input:?}"
+            );
+            assert_eq!(
+                StrengthRating::from_text(input),
+                None,
+                "Expected None from from_text for: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_display_and_trait() {
+        let err = ParseStrengthRatingError;
+        assert_eq!(err.to_string(), "invalid password strength rating");
+        let err_trait: &dyn std::error::Error = &err;
+        assert!(err_trait.source().is_none());
+    }
+}

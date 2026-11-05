@@ -567,6 +567,78 @@ pub enum StrengthRating {
     Cryptographic, // >= 128 bits (e.g., 8 verified words from 200k list = ~141 bits)
 }
 
+impl StrengthRating {
+    /// Returns the human-readable textual representation of the strength rating.
+    #[inline]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::VeryWeak => "Very Weak",
+            Self::Weak => "Weak",
+            Self::Reasonable => "Reasonable",
+            Self::Strong => "Strong",
+            Self::Cryptographic => "Cryptographic",
+        }
+    }
+
+    /// Parses a textual string into a `StrengthRating`, ignoring case and delimiters.
+    #[inline]
+    pub fn from_text(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+}
+
+impl std::fmt::Display for StrengthRating {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for StrengthRating {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseStrengthRatingError;
+
+impl std::fmt::Display for ParseStrengthRatingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid password strength rating")
+    }
+}
+
+impl std::error::Error for ParseStrengthRatingError {}
+
+impl std::str::FromStr for StrengthRating {
+    type Err = ParseStrengthRatingError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut buf = [0u8; 16];
+        let mut len = 0;
+
+        for &b in s.as_bytes() {
+            if !b.is_ascii_whitespace() && b != b'_' && b != b'-' {
+                let slot = buf.get_mut(len).ok_or(ParseStrengthRatingError)?;
+                *slot = b.to_ascii_lowercase();
+                len += 1;
+            }
+        }
+
+        let normalized = buf.get(..len).ok_or(ParseStrengthRatingError)?;
+        match normalized {
+            b"veryweak" => Ok(Self::VeryWeak),
+            b"weak" => Ok(Self::Weak),
+            b"reasonable" => Ok(Self::Reasonable),
+            b"strong" => Ok(Self::Strong),
+            b"cryptographic" => Ok(Self::Cryptographic),
+            _ => Err(ParseStrengthRatingError),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PasswordAnalysis {
     pub normalized_length: usize,
