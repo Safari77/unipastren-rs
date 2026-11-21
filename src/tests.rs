@@ -45,7 +45,7 @@ fn test_interleaved_sequences_and_words_caught() {
 #[test]
 fn test_compound_multilingual_unverified_words() {
     let no_dict = PasswordChecker::new();
-    // 5 concatenated words across 3 languages (31 chars) should score ~63.8 bits (Reasonable),
+    // 5 concatenated words across 3 languages (31 chars) should score ~61.2 bits (Reasonable),
     // not 26.57 bits (VeryWeak).
     let res = no_dict.analyze("monkeysikapaviaaniachtungisland");
     assert!(
@@ -53,7 +53,7 @@ fn test_compound_multilingual_unverified_words() {
         "Expected >= 60 bits for 31-char 5-word compound passphrase, got {}",
         res.entropy_bits
     );
-    assert_eq!(res.rating, StrengthRating::Strong);
+    assert_eq!(res.rating, StrengthRating::Reasonable);
 }
 
 #[test]
@@ -140,7 +140,8 @@ fn test_repeats_and_sequences_penalized() {
 
     let r_666 = checker.analyze("666");
     assert_eq!(r_666.rating, StrengthRating::VeryWeak);
-    assert!(r_666.entropy_bits <= 2.0);
+    // log2(10 digits) + log2(3 repeats) ≈ 4.91 bits
+    assert!(r_666.entropy_bits <= 5.0);
 
     let r_aie = checker.analyze("aieaie");
     assert_eq!(r_aie.rating, StrengthRating::VeryWeak);
@@ -378,6 +379,297 @@ fn test_multirrow_qwerty_diagonal_walks() {
         res.segments
     );
     assert_eq!(res.rating, StrengthRating::VeryWeak);
+}
+
+#[test]
+fn test_small_alphabet_cap_and_low_diversity_warnings() {
+    let checker = PasswordChecker::new();
+
+    // 1. 3-unique-char password with all distinct 3-grams ("xY7x7Y77xYx", 11 chars):
+    //    DP literals alone score ~46.19 bits, so the empirical small-alphabet bound (~30.16 bits) must cap it.
+    let res_capped = checker.analyze("xY7x7Y77xYx");
+    assert!(
+        res_capped.entropy_bits < 31.0,
+        "Expected small-alphabet cap < 31 bits for 3-char 11-len string, got {}",
+        res_capped.entropy_bits
+    );
+    assert_eq!(res_capped.rating, StrengthRating::VeryWeak);
+    assert!(
+        res_capped.warnings.iter().any(|w| w.contains("entropy capped at")),
+        "Expected small-alphabet cap warning, got {:?}",
+        res_capped.warnings
+    );
+
+    // 2. 2-unique-char 36-char mash must not trigger interleaved UnverifiedWord false positive
+    //    and must stay within log2(C(26, 2)) + 36 (~44.34 bits) with a low-diversity warning.
+    let res_binary = checker.analyze("rrkrkrkkkrkrkkrrkkrkkrrkkrrrkkrrkrkr");
+    assert!(
+        !res_binary.segments.iter().any(|s| matches!(s.kind, SegmentKind::UnverifiedWord(_))),
+        "2-char mash should not be classified as UnverifiedWord, got {:?}",
+        res_binary.segments
+    );
+    assert!(
+        res_binary.entropy_bits <= 44.5,
+        "Expected 36-char 2-unique-char entropy <= 44.5 bits, got {}",
+        res_binary.entropy_bits
+    );
+    assert!(
+        res_binary.warnings.iter().any(|w| w.contains("Low character diversity")),
+        "Expected low character diversity warning, got {:?}",
+        res_binary.warnings
+    );
+}
+
+#[test]
+fn test_ranked_fst_dictionary_scoring() -> Result<(), Box<dyn std::error::Error>> {
+    let mut entries: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for i in 0..9_997u64 {
+        entries.insert(format!("word{:05}", i), i + 200);
+    }
+    entries.insert("common".to_string(), 1);
+    entries.insert("medium".to_string(), 100);
+    entries.insert("zephyr".to_string(), 8_000);
+
+    let mut ranked_builder = fst::MapBuilder::memory();
+    for (word, rank) in &entries {
+        ranked_builder.insert(word.as_bytes(), *rank)?;
+    }
+    let ranked_checker = PasswordChecker::new().with_fst_bytes(ranked_builder.into_inner()?)?;
+    assert_eq!(ranked_checker.dictionary_size(), 10_000);
+
+    let res_common = ranked_checker.analyze("common");
+    let res_medium = ranked_checker.analyze("medium");
+    let res_rare = ranked_checker.analyze("zephyr");
+
+    assert!(
+        (res_common.entropy_bits - 1.0).abs() < 0.01,
+        "Rank-1 word should score 1.0 bit, got {}",
+        res_common.entropy_bits
+    );
+    assert!(
+        (res_medium.entropy_bits - 100.0_f64.log2()).abs() < 0.01,
+        "Rank-100 word should score ~6.64 bits, got {}",
+        res_medium.entropy_bits
+    );
+    assert!(
+        (res_rare.entropy_bits - 8_000.0_f64.log2()).abs() < 0.01,
+        "Rank-8000 word should score ~12.97 bits, got {}",
+        res_rare.entropy_bits
+    );
+    assert!(res_common.entropy_bits < res_medium.entropy_bits);
+    assert!(res_medium.entropy_bits < res_rare.entropy_bits);
+
+    // Interleaved match against a ranked FST must also use the word's rank entropy
+    let res_interleaved = ranked_checker.analyze("c.o.m.m.o.n");
+    assert!(
+        res_interleaved.segments.iter().any(|s| matches!(s.kind, SegmentKind::DictionaryWord(_))),
+        "Expected DictionaryWord for interleaved ranked match, got {:?}",
+        res_interleaved.segments
+    );
+    assert!(
+        res_interleaved.entropy_bits < 8.0,
+        "Expected interleaved rank-1 word < 8 bits, got {}",
+        res_interleaved.entropy_bits
+    );
+
+    // Unranked FST (all values == 0) must fall back to log2(dict_size)
+    let mut unranked_builder = fst::MapBuilder::memory();
+    for word in entries.keys() {
+        unranked_builder.insert(word.as_bytes(), 0)?;
+    }
+    let unranked_checker = PasswordChecker::new().with_fst_bytes(unranked_builder.into_inner()?)?;
+    let res_unranked = unranked_checker.analyze("common");
+    assert!(
+        (res_unranked.entropy_bits - 10_000.0_f64.log2()).abs() < 0.01,
+        "Unranked FST entry should fall back to log2(dict_size) (~13.29 bits), got {}",
+        res_unranked.entropy_bits
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_tandem_repeat_zwj_grapheme_scaling() {
+    let checker = PasswordChecker::new();
+
+    // 3x repeated 7-scalar ZWJ emoji ("👨‍👩‍👧‍👦") must scale unit entropy by 1/7
+    // so TandemRepeat wins (~11.3 bits) instead of falling back to 3 literals (~28.9 bits).
+    let res = checker.analyze("👨‍👩‍👧‍👦👨‍👩‍👧‍👦👨‍👩‍👧‍👦");
+    assert!(
+        res.segments.iter().any(|s| matches!(s.kind, SegmentKind::TandemRepeat { repeats: 3, .. })),
+        "Expected TandemRepeat of 3 for 3x ZWJ family emoji, got {:?}",
+        res.segments
+    );
+    assert!(
+        res.entropy_bits < 15.0,
+        "Expected 3x ZWJ family emoji < 15 bits after grapheme scaling, got {}",
+        res.entropy_bits
+    );
+    assert_eq!(res.rating, StrengthRating::VeryWeak);
+}
+
+#[test]
+fn test_short_dict_substrings_do_not_fracture_unverified_word() {
+    let mut words: Vec<String> = (0..4_998).map(|i| format!("w{:05}", i)).collect();
+    words.push("is".to_string());
+    words.push("an".to_string());
+    let checker = PasswordChecker::new().with_dictionary(words);
+
+    // "is" is in the 5000-word dictionary (~12.29 bits > 9.40 bits literal cost),
+    // so it must not mark covered_by_dict and fracture "kissa" into literals (~23.5 bits).
+    let res = checker.analyze("kissa");
+    assert!(
+        res.segments
+            .iter()
+            .any(|s| matches!(s.kind, SegmentKind::UnverifiedWord(ref w) if w == "kissa")),
+        "Expected 'kissa' to remain a single UnverifiedWord, got {:?}",
+        res.segments
+    );
+    assert!(
+        res.entropy_bits < 11.0,
+        "Expected ~9.97 bits for unverified 'kissa', got {}",
+        res.entropy_bits
+    );
+}
+
+#[test]
+fn test_repeat_pricing_monotonic_without_post_dp_subtraction() {
+    let checker = PasswordChecker::new();
+
+    // Appending a repeated 3-char prefix must never reduce total entropy below the base prefix.
+    let base = checker.analyze("z9!k");
+    let extended = checker.analyze("z9!kz9!");
+    assert!(
+        extended.segments.iter().any(|s| matches!(s.kind, SegmentKind::PreviousRepeat(_))),
+        "Expected PreviousRepeat in 'z9!kz9!', got {:?}",
+        extended.segments
+    );
+    assert!(
+        extended.entropy_bits >= base.entropy_bits,
+        "Appending characters reduced entropy: base={} bits, extended={} bits",
+        base.entropy_bits,
+        extended.entropy_bits
+    );
+}
+
+#[test]
+fn test_interleaved_mixed_case_random_not_unverified_word() {
+    let checker = PasswordChecker::new();
+
+    // Non-sequential, non-keyboard, random mixed-case letters with a constant delimiter
+    // must not be misclassified as an interleaved UnverifiedWord.
+    let res = checker.analyze("k-M-p-X-q-Z");
+    assert!(
+        !res.segments.iter().any(|s| matches!(s.kind, SegmentKind::UnverifiedWord(_))),
+        "Mixed-case interleaved random chars should not match UnverifiedWord, got {:?}",
+        res.segments
+    );
+}
+
+#[test]
+fn test_unverified_run_entropy_smooth_above_9_chars() {
+    let checker = PasswordChecker::new();
+
+    // 9 -> 10 chars with no sequences, keyboard walks, or repeats must ramp smoothly
+    // rather than jumping by ~18 bits at length 10.
+    let res_9 = checker.analyze("bkpvmtcgz");
+    let res_10 = checker.analyze("bkpvmtcgzf");
+    let delta = res_10.entropy_bits - res_9.entropy_bits;
+    assert!(
+        delta > 0.0 && delta < 5.0,
+        "Expected smooth entropy increase from 9 to 10 chars, got {} -> {} (delta {})",
+        res_9.entropy_bits,
+        res_10.entropy_bits,
+        delta
+    );
+}
+
+#[test]
+fn test_prefix_relaxed_sequence_overlap_and_trailing_unverified_word() {
+    // 1. Sequence "abcd" overlapping dictionary word "deer" in "abcdeer":
+    //    Prefix relaxation must allow Sequence("abc") + DictionaryWord("deer").
+    let mut dict: Vec<String> = (0..99).map(|i| format!("w{:04}", i)).collect();
+    dict.push("deer".to_string());
+    let dict_checker = PasswordChecker::new().with_dictionary(dict);
+
+    let res_overlap = dict_checker.analyze("abcdeer");
+    assert!(
+        res_overlap
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, SegmentKind::Sequence(ref w) if w == "abc")),
+        "Expected prefix Sequence('abc'), got {:?}",
+        res_overlap.segments
+    );
+    assert!(
+        res_overlap
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, SegmentKind::DictionaryWord(ref w) if w == "deer")),
+        "Expected overlapping DictionaryWord('deer'), got {:?}",
+        res_overlap.segments
+    );
+
+    // 2. Prefix sequence must not block a trailing UnverifiedWord on the same script run.
+    let no_dict = PasswordChecker::new();
+    let res_trailing = no_dict.analyze("abcdefghikissa");
+    assert!(
+        res_trailing
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, SegmentKind::Sequence(ref w) if w == "abcdefghi")),
+        "Expected leading Sequence('abcdefghi'), got {:?}",
+        res_trailing.segments
+    );
+    assert!(
+        res_trailing
+            .segments
+            .iter()
+            .any(|s| matches!(s.kind, SegmentKind::UnverifiedWord(ref w) if w == "kissa")),
+        "Expected trailing UnverifiedWord('kissa'), got {:?}",
+        res_trailing.segments
+    );
+}
+
+#[test]
+fn test_case_insensitive_sequence_and_stride2_default_off() {
+    let checker = PasswordChecker::new();
+
+    let res_lower = checker.analyze("abcdefgh");
+    let res_mixed = checker.analyze("aBcDeFgH");
+    assert!(
+        res_mixed.segments.iter().any(|s| matches!(s.kind, SegmentKind::Sequence(_))),
+        "Expected case-insensitive Sequence for 'aBcDeFgH', got {:?}",
+        res_mixed.segments
+    );
+    assert!(
+        res_mixed.entropy_bits > res_lower.entropy_bits && res_mixed.entropy_bits < 20.0,
+        "Expected mixed-case sequence to score above lowercase ({}) but below literals, got {}",
+        res_lower.entropy_bits,
+        res_mixed.entropy_bits
+    );
+
+    // Stride-2 sequences are disabled by default via ENABLE_STRIDE2_SEQUENCES
+    if !ENABLE_STRIDE2_SEQUENCES {
+        let res_stride2 = checker.analyze("13579");
+        assert!(
+            !res_stride2.segments.iter().any(|s| matches!(s.kind, SegmentKind::Sequence(_))),
+            "Stride-2 '13579' should not be flagged when ENABLE_STRIDE2_SEQUENCES is false, got {:?}",
+            res_stride2.segments
+        );
+    }
+}
+
+#[test]
+fn test_raw_slice_entropy_discounts_whitespace() {
+    let expected = 26.0_f64.log2() + REPEATED_LITERAL_ENTROPY_BITS;
+    let actual = PasswordChecker::raw_slice_entropy(&['a', ' ']);
+    assert!(
+        (actual - expected).abs() < 1e-6,
+        "Expected raw_slice_entropy(&['a', ' ']) == {}, got {}",
+        expected,
+        actual
+    );
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -26,6 +26,10 @@ const MAX_REPEAT_PERIOD: usize = 32;
 
 /// Maximum length of a constant separator inserted between characters of a word or sequence (e.g. "b22a22t22...").
 const MAX_INTERLEAVE_SEP_LEN: usize = 4;
+
+/// Enables detecting stride-2 monotonic Unicode sequences (e.g., "13579", "aceg") of length >= 4.
+/// Disabled by default to avoid over-flagging short coincidental patterns.
+pub const ENABLE_STRIDE2_SEQUENCES: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnicodePool {
@@ -726,7 +730,7 @@ impl PasswordChecker {
         Ok(self)
     }
 
-    /// Configures the fallback pool size for unverified words (default: 100).
+    /// Configures the fallback pool size for unverified words (default: 1000).
     pub fn with_unverified_pool_size(mut self, pool_size: usize) -> Self {
         self.unverified_pool_size = pool_size.max(2);
         self
@@ -1000,25 +1004,29 @@ impl PasswordChecker {
         self
     }
 
-    /// Walks a raw FST automaton over `bytes` starting at `start_byte` and invokes `on_match(end_byte)`
-    /// every time a final state is reached. Runs in O(word_length) with zero allocations.
+    /// Walks a raw FST automaton over `bytes` starting at `start_byte` and invokes `on_match(end_byte, rank)`
+    /// every time a final state is reached (`rank == 0` for unranked FSTs, `rank >= 1` for frequency-ranked FSTs).
+    /// Runs in O(word_length) with zero allocations.
     #[inline]
-    fn find_fst_prefixes<D: AsRef<[u8]>, F: FnMut(usize)>(
+    fn find_fst_prefixes<D: AsRef<[u8]>, F: FnMut(usize, u64)>(
         fst: &fst::raw::Fst<D>,
         bytes: &[u8],
         start_byte: usize,
         mut on_match: F,
     ) {
         let mut node = fst.root();
+        let mut out = fst::raw::Output::zero();
         let Some(tail) = bytes.get(start_byte..) else {
             return;
         };
         for (offset, &b) in tail.iter().enumerate() {
             if let Some(trans_idx) = node.find_input(b) {
                 let trans = node.transition(trans_idx);
+                out = out.cat(trans.out);
                 node = fst.node(trans.addr);
                 if node.is_final() {
-                    on_match(start_byte + offset + 1);
+                    let rank = out.cat(node.final_output()).value();
+                    on_match(start_byte + offset + 1, rank);
                 }
             } else {
                 break;
@@ -1026,26 +1034,35 @@ impl PasswordChecker {
         }
     }
 
-    /// Checks if an exact string exists in the configured dictionary (FST or Aho-Corasick).
+    /// Entropy in bits for a verified dictionary word, using its 1-based frequency rank if stored
+    /// in a ranked FST (`rank >= 1`), or falling back to `log2(dict_size)` when unranked (`rank == 0`).
     #[inline]
-    fn is_exact_dict_match(&self, s: &str) -> bool {
+    fn dict_entry_entropy(&self, rank: u64) -> f64 {
+        let full_dict_bits = self.verified_word_entropy();
+        if rank == 0 { full_dict_bits } else { (rank.max(2) as f64).log2().min(full_dict_bits) }
+    }
+
+    /// Returns the entropy in bits if an exact string exists in the configured dictionary
+    /// (FST or Aho-Corasick), respecting frequency ranks stored in FST outputs when present.
+    #[inline]
+    fn exact_dict_match_entropy(&self, s: &str) -> Option<f64> {
         if let Some(ref fst) = self.embedded_fst {
-            return fst.contains_key(s.as_bytes());
+            return fst.get(s.as_bytes()).map(|out| self.dict_entry_entropy(out.value()));
         }
         if let Some(ref fst) = self.fst_dict {
-            return fst.contains_key(s.as_bytes());
+            return fst.get(s.as_bytes()).map(|out| self.dict_entry_entropy(out.value()));
         }
         if let Some(ref ac) = self.automaton {
             for mat in ac.find_iter(s) {
                 if mat.start() == 0 && mat.end() == s.len() {
-                    return true;
+                    return Some(self.verified_word_entropy());
                 }
                 if mat.start() > 0 {
                     break;
                 }
             }
         }
-        false
+        None
     }
 
     /// Entropy in bits for a verified word from the configured dictionary.
@@ -1070,16 +1087,21 @@ impl PasswordChecker {
     }
 
     /// Raw baseline entropy of a slice of characters without heap allocations.
+    /// Whitespace characters are priced separately at `REPEATED_LITERAL_ENTROPY_BITS`.
     fn raw_slice_entropy(slice: &[char]) -> f64 {
         let mut mask: u32 = 0;
         let mut total_pool: f64 = 0.0;
         let mut other_planes = [u32::MAX; 32];
         let mut other_len = 0usize;
+        let mut non_ws_count = 0usize;
+        let mut ws_count = 0usize;
 
         for &c in slice {
             if c.is_whitespace() {
+                ws_count += 1;
                 continue;
             }
+            non_ws_count += 1;
             let pool = UnicodePool::classify(c);
             let bit: Option<u32> = match pool {
                 UnicodePool::AsciiLower => Some(1 << 0),
@@ -1131,7 +1153,130 @@ impl PasswordChecker {
                 total_pool += pool.pool_size();
             }
         }
-        (slice.len() as f64) * total_pool.max(2.0).log2()
+
+        let non_ws_bits =
+            if non_ws_count > 0 { (non_ws_count as f64) * total_pool.max(2.0).log2() } else { 0.0 };
+        non_ws_bits + (ws_count as f64) * REPEATED_LITERAL_ENTROPY_BITS
+    }
+
+    /// Additional entropy in bits for case variations within a case-insensitive sequence match.
+    /// Uniform case ("abcdef", "ABCDEF") adds 0 bits; TitleCase ("Abcdef") adds 1 bit;
+    /// mixed casing ("aBcDeF") adds 1 bit per case transition (capped at the sequence length).
+    #[inline]
+    fn sequence_case_bits(slice: &[char]) -> f64 {
+        let mut transitions = 0usize;
+        let mut prev_case: Option<bool> = None;
+        for &c in slice {
+            let cur_case = if c.is_uppercase() {
+                Some(true)
+            } else if c.is_lowercase() {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(cur) = cur_case {
+                if let Some(prev) = prev_case
+                    && prev != cur
+                {
+                    transitions += 1;
+                }
+                prev_case = Some(cur);
+            }
+        }
+        transitions.min(slice.len()) as f64
+    }
+
+    /// Computes log2(n!) in O(n) time for small-to-medium sequence lengths.
+    #[inline]
+    fn log2_factorial(n: usize) -> f64 {
+        (2..=n).map(|k| (k as f64).log2()).sum()
+    }
+
+    /// Computes log2(C(n, k)) in O(k) time, falling back to `k * log2(n)` if `k > n`.
+    #[inline]
+    fn log2_binom(n: f64, k: usize) -> f64 {
+        if k == 0 || n <= 1.0 {
+            return 0.0;
+        }
+        if (k as f64) > n {
+            return (k as f64) * n.log2();
+        }
+        let mut sum = 0.0;
+        for j in 0..k {
+            let num = n - (j as f64);
+            let den = (j + 1) as f64;
+            if num > 0.0 {
+                sum += (num / den).log2();
+            }
+        }
+        sum.max(0.0)
+    }
+
+    /// Computes `(unique_graphemes, total_graphemes, upper_bound_bits)` from the empirical
+    /// extended-grapheme alphabet and frequency distribution of the password.
+    /// Combines per-pool unordered alphabet selection with the tighter of the uniform
+    /// small-alphabet bound (`L * log2(k)`) and the multinomial + composition bound.
+    fn distinct_grapheme_entropy_bound(
+        chars: &[char],
+        is_grapheme_continuation: &[bool],
+    ) -> (usize, usize, f64) {
+        let n = chars.len();
+        if n == 0 {
+            return (0, 0, 0.0);
+        }
+
+        let mut counts: HashMap<&[char], usize> = HashMap::new();
+        let mut total_graphemes = 0usize;
+        let mut idx = 0usize;
+
+        while idx < n {
+            let mut end = idx + 1;
+            while end < n && is_grapheme_continuation.get(end).copied().unwrap_or(false) {
+                end += 1;
+            }
+            if let Some(grapheme) = chars.get(idx..end) {
+                *counts.entry(grapheme).or_insert(0) += 1;
+                total_graphemes += 1;
+            }
+            idx = end;
+        }
+
+        let unique_graphemes = counts.len();
+        if unique_graphemes == 0 {
+            return (0, 0, 0.0);
+        }
+
+        // Per-pool alphabet selection: sum of log2(C(pool_size, unique_in_pool))
+        let mut pool_counts: HashMap<Option<UnicodePool>, usize> = HashMap::new();
+        for grapheme in counts.keys() {
+            if let Some(&first) = grapheme.first() {
+                let key =
+                    if first.is_whitespace() { None } else { Some(UnicodePool::classify(first)) };
+                *pool_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        let alphabet_bits: f64 = pool_counts
+            .iter()
+            .map(|(pool_opt, &k_p)| {
+                let pool_size = pool_opt.map_or(2.0, |p| p.pool_size());
+                Self::log2_binom(pool_size, k_p)
+            })
+            .sum();
+
+        let arrangement_bits = if unique_graphemes == 1 {
+            (total_graphemes as f64).log2()
+        } else {
+            let uniform_bits = (total_graphemes as f64) * (unique_graphemes as f64).log2();
+            let denom_log2: f64 = counts.values().map(|&c| Self::log2_factorial(c)).sum();
+            let multinomial_bits = (Self::log2_factorial(total_graphemes) - denom_log2).max(0.0);
+            let composition_bits =
+                Self::log2_binom((total_graphemes - 1) as f64, unique_graphemes - 1);
+            uniform_bits.min(multinomial_bits + composition_bits)
+        };
+
+        counts.clear();
+        (unique_graphemes, total_graphemes, alphabet_bits + arrangement_bits)
     }
 
     /// Returns true if `unit` is a primitive period (not itself a repetition of a smaller divisor period).
@@ -1176,9 +1321,9 @@ impl PasswordChecker {
     }
 
     /// Estimates the entropy of an unverified single-script alphabetic run.
-    /// Single short words score conservatively (`unverified_bits`, ~6.64 bits for Latin), while long
-    /// unspaced compound runs (e.g. "monkeysikapaviaaniachtungisland") scale with estimated word count
-    /// and compound/multilingual word-choice diversity.
+    /// Single short words score conservatively (`unverified_bits`, ~9.97 bits for Latin), while long
+    /// unspaced compound runs (e.g. "monkeysikapaviaaniachtungisland") ramp smoothly above 9 chars
+    /// to reflect multi-word compound/multilingual vocabulary diversity without a cliff at length 10.
     fn unverified_run_entropy(&self, run: &[char], family: ScriptFamily) -> f64 {
         let run_len = run.len();
         let unverified_bits = self.unverified_word_entropy();
@@ -1196,28 +1341,31 @@ impl PasswordChecker {
             return base_word_bits;
         }
 
-        // Long compound word run without spaces (e.g. "monkeysikapaviaaniachtungisland"):
-        // Estimate constituent words using ~6 chars/word average and add compound/multilingual
-        // vocabulary scaling (each concatenated word beyond the first reflects a broader ~1000-word
-        // vocabulary + language/combinatorial choice -> ~10.5 bits/word).
-        let estimated_words = (run_len as f64 / 6.0).ceil();
-        let compound_per_word_bits = base_word_bits + 4.0;
-        estimated_words * compound_per_word_bits
+        // Smooth continuous ramp above 9 chars using ~6 chars/word average compound scaling
+        let per_extra_char = ((base_word_bits + 4.0) / 6.0).min(single_char_bits.max(1.0));
+        base_word_bits + ((run_len - 9) as f64) * per_extra_char
     }
 
     /// Relaxes a DP state transition with a single bounds check.
+    /// Updates `segment_end_boundary[target]` whenever `dp[target]` improves, so only a winning
+    /// maximal structured segment opens a boundary for a trailing `UnverifiedWord`.
     #[inline(always)]
     fn relax_dp(
         dp: &mut [(f64, usize, Option<RawSegment>)],
+        segment_end_boundary: &mut [bool],
         target: usize,
         new_cost: f64,
         prev: usize,
         seg: RawSegment,
+        is_maximal_boundary: bool,
     ) {
         if let Some(cell) = dp.get_mut(target)
             && new_cost < cell.0
         {
             *cell = (new_cost, prev, Some(seg));
+            if let Some(b) = segment_end_boundary.get_mut(target) {
+                *b = is_maximal_boundary;
+            }
         }
     }
 
@@ -1228,7 +1376,7 @@ impl PasswordChecker {
         result
     }
 
-    /// Evaluates password strength across all UTF-8 scripts using NFC, Aho-Corasick, and DP.
+    /// Evaluates password strength across all UTF-8 scripts using NFC, FST/Aho-Corasick, and DP.
     /// All internal temporary buffers containing password characters or substrings are zeroized before return.
     pub fn analyze(&self, password: &str) -> PasswordAnalysis {
         // Lazily NFC-normalize and take at most max_chars + 1 to detect truncation in O(max_chars) time
@@ -1293,20 +1441,56 @@ impl PasswordChecker {
             }
         }
 
-        // Precompute UAX #29 word segment lengths in O(n) time before zeroizing lower_str
+        // Precompute empirical distinct-grapheme upper bound before zeroizing `chars`
+        let (unique_graphemes, total_graphemes, small_alphabet_bound) =
+            Self::distinct_grapheme_entropy_bound(&chars, &is_grapheme_continuation);
+
+        // Precompute UAX #29 word segment spans in O(n) time before zeroizing lower_str
+        let mut uax29_word_start = vec![usize::MAX; n];
         let mut uax29_word_end = vec![0usize; n];
         for (byte_idx, word) in lower_str.unicode_word_indices() {
             if let (Some(&start_c), Some(&end_c)) =
                 (byte_to_char.get(byte_idx), byte_to_char.get(byte_idx + word.len()))
-                && let Some(word_slice) = uax29_word_end.get_mut(start_c..end_c.min(n))
             {
-                word_slice.fill(end_c);
+                let clamped_end = end_c.min(n);
+                if let Some(start_slice) = uax29_word_start.get_mut(start_c..clamped_end) {
+                    start_slice.fill(start_c);
+                }
+                if let Some(end_slice) = uax29_word_end.get_mut(start_c..clamped_end) {
+                    end_slice.fill(end_c);
+                }
             }
         }
 
-        // Precompute all dictionary matches using embedded FST, owned FST, or Aho-Corasick
-        let mut dict_matches_at: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // Precompute all dictionary matches using embedded FST, owned FST, or Aho-Corasick.
+        // Only mark `covered_by_dict` for matches that are cheaper than raw literals AND either
+        // span a full UAX #29 word or meet the script's minimum coverage length, so short 2-3 char
+        // dictionary substrings (like "is" inside "kissa") never fracture an unverified word.
+        let mut dict_matches_at: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
         let mut covered_by_dict = vec![false; n];
+        let mut record_dict_match = |start_c: usize, end_c: usize, rank: u64| {
+            let match_bits = self.dict_entry_entropy(rank);
+            if let Some(matches) = dict_matches_at.get_mut(start_c) {
+                matches.push((end_c, match_bits));
+            }
+            if let Some(match_slice) = chars.get(start_c..end_c)
+                && match_bits < Self::raw_slice_entropy(match_slice)
+            {
+                let first_family = families.get(start_c).copied().unwrap_or(ScriptFamily::NonWord);
+                let min_cov_len = match first_family {
+                    ScriptFamily::CjkIdeograph | ScriptFamily::Hangul => 2,
+                    _ => 4,
+                };
+                let is_full_word = uax29_word_start.get(start_c).copied() == Some(start_c)
+                    && uax29_word_end.get(start_c).copied() == Some(end_c);
+                if ((end_c - start_c) >= min_cov_len || is_full_word)
+                    && let Some(cov_slice) = covered_by_dict.get_mut(start_c..end_c)
+                {
+                    cov_slice.fill(true);
+                }
+            }
+        };
+
         if self.embedded_fst.is_some() || self.fst_dict.is_some() {
             let lower_bytes = lower_str.as_bytes();
             let mut prev_char = usize::MAX;
@@ -1315,24 +1499,19 @@ impl PasswordChecker {
                     continue;
                 }
                 prev_char = start_c;
-                let record_match = |end_byte: usize| {
+                let mut on_fst_match = |end_byte: usize, rank: u64| {
                     if let Some(&end_c) = byte_to_char.get(end_byte)
                         && start_c < end_c
                         && end_c <= n
                         && byte_to_char.get(end_byte.saturating_sub(1)) != Some(&end_c)
                     {
-                        if let Some(matches) = dict_matches_at.get_mut(start_c) {
-                            matches.push(end_c);
-                        }
-                        if let Some(cov_slice) = covered_by_dict.get_mut(start_c..end_c) {
-                            cov_slice.fill(true);
-                        }
+                        record_dict_match(start_c, end_c, rank);
                     }
                 };
                 if let Some(ref fst) = self.embedded_fst {
-                    Self::find_fst_prefixes(fst, lower_bytes, byte_idx, record_match);
+                    Self::find_fst_prefixes(fst, lower_bytes, byte_idx, &mut on_fst_match);
                 } else if let Some(ref fst) = self.fst_dict {
-                    Self::find_fst_prefixes(fst, lower_bytes, byte_idx, record_match);
+                    Self::find_fst_prefixes(fst, lower_bytes, byte_idx, &mut on_fst_match);
                 }
             }
         } else if let Some(ref ac) = self.automaton {
@@ -1342,17 +1521,12 @@ impl PasswordChecker {
                     && start_c < end_c
                     && end_c <= n
                 {
-                    if let Some(matches) = dict_matches_at.get_mut(start_c) {
-                        matches.push(end_c);
-                    }
-                    if let Some(cov_slice) = covered_by_dict.get_mut(start_c..end_c) {
-                        cov_slice.fill(true);
-                    }
+                    record_dict_match(start_c, end_c, 0);
                 }
             }
         }
 
-        // Zeroize temporary lowercase string & byte map immediately after Aho-Corasick and UAX #29 matching
+        // Zeroize temporary lowercase string & byte map immediately after dictionary and UAX #29 matching
         lower_str.zeroize();
         byte_to_char.zeroize();
 
@@ -1373,7 +1547,11 @@ impl PasswordChecker {
             *first_dp = (0.0, 0, None);
         }
 
-        let verified_bits = self.verified_word_entropy();
+        // Tracks indices where the winning DP path ends a maximal structured segment
+        // (repeat, sequence, keyboard walk, or dict word), allowing an UnverifiedWord to start
+        // immediately after a prefix pattern (e.g. "abcdefghikissa") without splitting mid-pattern.
+        let mut segment_end_boundary = vec![false; n + 1];
+
         let unverified_bits = self.unverified_word_entropy();
 
         let mut core_chars = Vec::with_capacity(n);
@@ -1413,10 +1591,12 @@ impl PasswordChecker {
             };
             Self::relax_dp(
                 &mut dp,
+                &mut segment_end_boundary,
                 i + 1,
                 current_cost + step_cost,
                 i,
                 RawSegment { kind: RawSegmentKind::Literal(i), entropy_bits: step_cost },
+                false,
             );
 
             if is_continuation {
@@ -1424,7 +1604,6 @@ impl PasswordChecker {
             }
 
             // 2. Tandem / periodic repeat detection starting at i (e.g., "666", "aieaie", "👍🏽👍🏽👍🏽")
-            let mut has_tandem_repeat = false;
             let max_period = ((n - i) / 2).min(MAX_REPEAT_PERIOD);
             for period in 1..=max_period {
                 if is_grapheme_continuation.get(i + period).copied().unwrap_or(false) {
@@ -1443,12 +1622,7 @@ impl PasswordChecker {
                     tail.iter().zip(unit_lower.iter().cycle()).take_while(|(a, b)| a == b).count()
                 });
                 let match_len = period + tail_matches;
-
                 let repeats = match_len / period;
-                let clean_len = repeats * period;
-                if is_grapheme_continuation.get(i + clean_len).copied().unwrap_or(false) {
-                    continue;
-                }
 
                 let unit_graphemes = is_grapheme_continuation
                     .get(i..i + period)
@@ -1456,12 +1630,11 @@ impl PasswordChecker {
 
                 // Require >= 3 repeats for single graphemes ("666", "👍🏽👍🏽👍🏽") so normal double
                 // letters in words ("kissa") aren't misclassified, and >= 2 repeats for multi-grapheme units.
-                if ((unit_graphemes == 1 && repeats >= 3) || (unit_graphemes >= 2 && repeats >= 2))
+                let min_repeats = if unit_graphemes == 1 { 3 } else { 2 };
+                if repeats >= min_repeats
                     && let (Some(unit_slice), Some(unit_families)) =
                         (chars.get(i..i + period), families.get(i..i + period))
                 {
-                    has_tandem_repeat = true;
-
                     // Scale raw entropy by grapheme count so multi-codepoint emojis aren't overpriced,
                     // and cap alphabetic repeat units at unverified_bits.
                     let raw_base = Self::raw_slice_entropy(unit_slice)
@@ -1473,18 +1646,26 @@ impl PasswordChecker {
                     } else {
                         raw_base
                     };
-                    let repeat_bits = base_bits + (repeats as f64).log2();
 
-                    Self::relax_dp(
-                        &mut dp,
-                        i + clean_len,
-                        current_cost + repeat_bits,
-                        i,
-                        RawSegment {
-                            kind: RawSegmentKind::TandemRepeat { start: i, period, repeats },
-                            entropy_bits: repeat_bits,
-                        },
-                    );
+                    for r in min_repeats..=repeats {
+                        let span_end = i + r * period;
+                        if is_grapheme_continuation.get(span_end).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let repeat_bits = base_bits + (r as f64).log2();
+                        Self::relax_dp(
+                            &mut dp,
+                            &mut segment_end_boundary,
+                            span_end,
+                            current_cost + repeat_bits,
+                            i,
+                            RawSegment {
+                                kind: RawSegmentKind::TandemRepeat { start: i, period, repeats: r },
+                                entropy_bits: repeat_bits,
+                            },
+                            r == repeats,
+                        );
+                    }
                 }
             }
 
@@ -1519,43 +1700,72 @@ impl PasswordChecker {
 
                 if best_prev_len >= 3 {
                     let ref_bits = (i as f64 + 1.0).log2();
-                    Self::relax_dp(
-                        &mut dp,
-                        i + best_prev_len,
-                        current_cost + ref_bits,
-                        i,
-                        RawSegment {
-                            kind: RawSegmentKind::PreviousRepeat(i, i + best_prev_len),
-                            entropy_bits: ref_bits,
-                        },
-                    );
+                    for len in 3..=best_prev_len {
+                        let span_end = i + len;
+                        if is_grapheme_continuation.get(span_end).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        Self::relax_dp(
+                            &mut dp,
+                            &mut segment_end_boundary,
+                            span_end,
+                            current_cost + ref_bits,
+                            i,
+                            RawSegment {
+                                kind: RawSegmentKind::PreviousRepeat(i, span_end),
+                                entropy_bits: ref_bits,
+                            },
+                            len == best_prev_len,
+                        );
+                    }
                 }
             }
 
-            // 4. Monotonic Unicode codepoint sequences (e.g., "12345", "abcdef", "h.g.f.e.d.c.b.a")
-            let mut has_sequence = false;
-            if let Some(tail) = chars.get(i..)
-                && let Some(&next_ch) = tail.get(1)
+            // 4. Monotonic Unicode codepoint sequences (case-insensitive, e.g., "12345", "abcdef", "aBcDeF")
+            if let Some(lower_tail) = lower_chars.get(i..)
+                && let Some(&next_lower) = lower_tail.get(1)
             {
-                let delta = (next_ch as i64) - (ch_i as i64);
-                if delta.abs() == 1 {
-                    let seq_len = 1 + tail
+                let delta = i64::from(u32::from(next_lower)) - i64::from(u32::from(lower_i));
+                let valid_delta =
+                    delta.abs() == 1 || (ENABLE_STRIDE2_SEQUENCES && delta.abs() == 2);
+                if valid_delta {
+                    let min_seq_len = if delta.abs() == 2 { 4 } else { 3 };
+                    let seq_len = 1 + lower_tail
                         .windows(2)
-                        .take_while(|w| matches!(w, [a, b] if (*b as i64) - (*a as i64) == delta))
+                        .take_while(|w| {
+                            matches!(
+                                w,
+                                [a, b] if i64::from(u32::from(*b)) - i64::from(u32::from(*a)) == delta
+                            )
+                        })
                         .count();
-                    if seq_len >= 3 {
-                        has_sequence = true;
-                        let seq_bits = Self::char_entropy(ch_i) + (seq_len as f64).log2() + 1.0;
-                        Self::relax_dp(
-                            &mut dp,
-                            i + seq_len,
-                            current_cost + seq_bits,
-                            i,
-                            RawSegment {
-                                kind: RawSegmentKind::Sequence(i, i + seq_len),
-                                entropy_bits: seq_bits,
-                            },
-                        );
+                    if seq_len >= min_seq_len {
+                        let stride_bits = if delta.abs() == 2 { 1.0 } else { 0.0 };
+                        for len in min_seq_len..=seq_len {
+                            let span_end = i + len;
+                            if is_grapheme_continuation.get(span_end).copied().unwrap_or(false) {
+                                continue;
+                            }
+                            let case_bits =
+                                chars.get(i..span_end).map_or(0.0, Self::sequence_case_bits);
+                            let seq_bits = Self::char_entropy(ch_i)
+                                + (len as f64).log2()
+                                + 1.0
+                                + stride_bits
+                                + case_bits;
+                            Self::relax_dp(
+                                &mut dp,
+                                &mut segment_end_boundary,
+                                span_end,
+                                current_cost + seq_bits,
+                                i,
+                                RawSegment {
+                                    kind: RawSegmentKind::Sequence(i, span_end),
+                                    entropy_bits: seq_bits,
+                                },
+                                len == seq_len,
+                            );
+                        }
                     }
                 }
 
@@ -1565,34 +1775,43 @@ impl PasswordChecker {
                 let kb_len = kb_ids.get(i..).map_or(0, Self::keyboard_walk_len_ids);
                 let min_kb_len = if family == ScriptFamily::NonWord { 3 } else { 4 };
                 if kb_len >= min_kb_len {
-                    has_sequence = true;
-                    // Starting key choice + log2(walk_len) + ~2 bits for layout/direction choice
-                    let kb_bits = Self::char_entropy(ch_i) + (kb_len as f64).log2() + 2.0;
-                    Self::relax_dp(
-                        &mut dp,
-                        i + kb_len,
-                        current_cost + kb_bits,
-                        i,
-                        RawSegment {
-                            kind: RawSegmentKind::KeyboardSequence(i, i + kb_len),
-                            entropy_bits: kb_bits,
-                        },
-                    );
+                    for len in min_kb_len..=kb_len {
+                        let span_end = i + len;
+                        if is_grapheme_continuation.get(span_end).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        // Starting key choice + log2(walk_len) + ~2 bits for layout/direction choice
+                        let kb_bits = Self::char_entropy(ch_i) + (len as f64).log2() + 2.0;
+                        Self::relax_dp(
+                            &mut dp,
+                            &mut segment_end_boundary,
+                            span_end,
+                            current_cost + kb_bits,
+                            i,
+                            RawSegment {
+                                kind: RawSegmentKind::KeyboardSequence(i, span_end),
+                                entropy_bits: kb_bits,
+                            },
+                            len == kb_len,
+                        );
+                    }
                 }
             }
 
-            // 5. Aho-Corasick verified dictionary matches (supports compound words without spaces)
-            if let Some(ends) = dict_matches_at.get(i) {
-                for &end in ends {
+            // 5. Verified dictionary matches (FST or Aho-Corasick; supports compound words without spaces)
+            if let Some(matches) = dict_matches_at.get(i) {
+                for &(end, match_bits) in matches {
                     Self::relax_dp(
                         &mut dp,
+                        &mut segment_end_boundary,
                         end,
-                        current_cost + verified_bits,
+                        current_cost + match_bits,
                         i,
                         RawSegment {
                             kind: RawSegmentKind::DictionaryWord(i, end),
-                            entropy_bits: verified_bits,
+                            entropy_bits: match_bits,
                         },
+                        true,
                     );
                 }
             }
@@ -1605,9 +1824,10 @@ impl PasswordChecker {
                 let is_script_start = i == 0
                     || families.get(i - 1).copied() != Some(family)
                     || covered_by_dict.get(i - 1).copied().unwrap_or(false)
+                    || segment_end_boundary.get(i).copied().unwrap_or(false)
                     || (family != ScriptFamily::CjkIdeograph
                         && uax29_word_end.get(i - 1) != uax29_word_end.get(i));
-                if is_script_start && !has_tandem_repeat && !has_sequence {
+                if is_script_start {
                     let word_limit = if family == ScriptFamily::CjkIdeograph {
                         n
                     } else {
@@ -1636,6 +1856,7 @@ impl PasswordChecker {
                         let cost = self.unverified_run_entropy(word_slice, family);
                         Self::relax_dp(
                             &mut dp,
+                            &mut segment_end_boundary,
                             i + run_len,
                             current_cost + cost,
                             i,
@@ -1643,6 +1864,7 @@ impl PasswordChecker {
                                 kind: RawSegmentKind::UnverifiedWord(i, i + run_len),
                                 entropy_bits: cost,
                             },
+                            false,
                         );
                     }
                 }
@@ -1706,8 +1928,8 @@ impl PasswordChecker {
                     continue;
                 }
 
-                let (Some(&first_core_lower), Some(&first_core_char), Some(&second_core_char)) =
-                    (core_lower.first(), core_chars.first(), core_chars.get(1))
+                let (Some(&first_core_lower), Some(&second_core_lower), Some(&first_core_char)) =
+                    (core_lower.first(), core_lower.get(1), core_chars.first())
                 else {
                     continue;
                 };
@@ -1731,19 +1953,29 @@ impl PasswordChecker {
                 let sep_bits = Self::separator_entropy(sep_orig) + 1.0; // +1 bit for interleaving pattern
 
                 // 7a. Check if the de-interleaved core characters form a monotonic or keyboard sequence
-                let core_delta = (second_core_char as i64) - (first_core_char as i64);
-                let is_core_sequence = core_delta.abs() == 1
-                    && core_chars
-                        .windows(2)
-                        .all(|w| matches!(w, [a, b] if (*b as i64) - (*a as i64) == core_delta));
+                let core_delta = i64::from(u32::from(second_core_lower))
+                    - i64::from(u32::from(first_core_lower));
+                let valid_core_delta = core_delta.abs() == 1
+                    || (ENABLE_STRIDE2_SEQUENCES && core_delta.abs() == 2 && num_core >= 4);
+                let is_core_sequence = valid_core_delta && core_lower.windows(2).all(|w| {
+                    matches!(
+                        w,
+                        [a, b] if i64::from(u32::from(*b)) - i64::from(u32::from(*a)) == core_delta
+                    )
+                });
                 let is_core_kb = !is_core_sequence
                     && num_core >= 4
                     && Self::keyboard_walk_len_ids(&core_kb_ids) == num_core;
 
                 if is_core_sequence || is_core_kb {
+                    let case_bits =
+                        if is_core_kb { 0.0 } else { Self::sequence_case_bits(&core_chars) };
+                    let stride_bits = if !is_core_kb && core_delta.abs() == 2 { 1.0 } else { 0.0 };
                     let seq_bits = Self::char_entropy(first_core_char)
                         + (num_core as f64).log2()
-                        + if is_core_kb { 2.0 } else { 1.0 };
+                        + if is_core_kb { 2.0 } else { 1.0 }
+                        + stride_bits
+                        + case_bits;
                     let total_bits = seq_bits + sep_bits;
                     let kind = if is_core_kb {
                         RawSegmentKind::KeyboardSequence(i, span_end)
@@ -1752,10 +1984,12 @@ impl PasswordChecker {
                     };
                     Self::relax_dp(
                         &mut dp,
+                        &mut segment_end_boundary,
                         span_end,
                         current_cost + total_bits,
                         i,
                         RawSegment { kind, entropy_bits: total_bits },
+                        true,
                     );
                 } else {
                     // 7b. Otherwise, check if the de-interleaved core characters form a single-script word or dictionary match
@@ -1766,12 +2000,12 @@ impl PasswordChecker {
                         // Check dictionary match on the de-interleaved core string
                         core_lower_str.clear();
                         core_lower_str.extend(core_chars.iter().copied().flat_map(Self::fold_char));
-                        let matched_dict = self.is_exact_dict_match(&core_lower_str);
 
-                        if matched_dict {
-                            let total_bits = verified_bits + sep_bits;
+                        if let Some(dict_bits) = self.exact_dict_match_entropy(&core_lower_str) {
+                            let total_bits = dict_bits + sep_bits;
                             Self::relax_dp(
                                 &mut dp,
+                                &mut segment_end_boundary,
                                 span_end,
                                 current_cost + total_bits,
                                 i,
@@ -1779,20 +2013,41 @@ impl PasswordChecker {
                                     kind: RawSegmentKind::DictionaryWord(i, span_end),
                                     entropy_bits: total_bits,
                                 },
+                                true,
                             );
-                        } else if num_core >= 4 {
-                            let word_bits = self.unverified_run_entropy(&core_chars, core_family);
-                            let total_bits = word_bits + sep_bits;
-                            Self::relax_dp(
-                                &mut dp,
-                                span_end,
-                                current_cost + total_bits,
-                                i,
-                                RawSegment {
-                                    kind: RawSegmentKind::UnverifiedWord(i, span_end),
-                                    entropy_bits: total_bits,
-                                },
-                            );
+                        } else if num_core >= 4 && Self::has_natural_word_casing(&core_chars) {
+                            // Require at least 3 distinct folded core characters so 2-character mashes
+                            // (e.g., "rkrkrkkkrkrkk") aren't misclassified as interleaved unverified words.
+                            let mut distinct_core = [None; 3];
+                            let mut distinct_core_count = 0usize;
+                            for &c in &core_lower {
+                                if !distinct_core.contains(&Some(c)) {
+                                    if let Some(slot) = distinct_core.get_mut(distinct_core_count) {
+                                        *slot = Some(c);
+                                        distinct_core_count += 1;
+                                    }
+                                    if distinct_core_count >= 3 {
+                                        break;
+                                    }
+                                }
+                            }
+                            if distinct_core_count >= 3 {
+                                let word_bits =
+                                    self.unverified_run_entropy(&core_chars, core_family);
+                                let total_bits = word_bits + sep_bits;
+                                Self::relax_dp(
+                                    &mut dp,
+                                    &mut segment_end_boundary,
+                                    span_end,
+                                    current_cost + total_bits,
+                                    i,
+                                    RawSegment {
+                                        kind: RawSegmentKind::UnverifiedWord(i, span_end),
+                                        entropy_bits: total_bits,
+                                    },
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -1806,7 +2061,9 @@ impl PasswordChecker {
         core_lower_str.zeroize();
         kb_ids.zeroize();
         is_grapheme_continuation.zeroize();
+        uax29_word_start.zeroize();
         uax29_word_end.zeroize();
+        segment_end_boundary.zeroize();
 
         // Reconstruct minimum-entropy segmentation path and materialize strings only for the winning path
         let mut raw_segments = Vec::new();
@@ -1825,8 +2082,6 @@ impl PasswordChecker {
         // Zeroize temporary character buffers and DP table
         chars.zeroize();
         lower_chars.zeroize();
-        kb_ids.zeroize();
-        core_kb_ids.zeroize();
         dp.zeroize();
 
         let mut segments = Self::merge_literals(raw_segments);
@@ -1841,7 +2096,31 @@ impl PasswordChecker {
             ));
         }
 
+        // Apply distinct-grapheme small-alphabet upper bound when characters repeat
+        let mut capped_by_small_alphabet = false;
+        if unique_graphemes < total_graphemes && small_alphabet_bound < total_entropy {
+            total_entropy = small_alphabet_bound;
+            capped_by_small_alphabet = true;
+        }
+
+        if self.emit_warnings
+            && (capped_by_small_alphabet || (unique_graphemes <= 3 && total_graphemes >= 6))
+        {
+            if capped_by_small_alphabet {
+                warnings.push(format!(
+                    "Low character diversity: only {} unique character(s) across {} characters (entropy capped at {:.2} bits).",
+                    unique_graphemes, total_graphemes, small_alphabet_bound
+                ));
+            } else {
+                warnings.push(format!(
+                    "Low character diversity: only {} unique character(s) across {} characters.",
+                    unique_graphemes, total_graphemes
+                ));
+            }
+        }
+
         // Inspect segments for bad repeating patterns, sequences, or unverified words
+        // (repeat costs are priced directly inside the DP so segmentation stays optimal and monotonic)
         for seg in &segments {
             match &seg.kind {
                 SegmentKind::TandemRepeat { unit, repeats, full_match } => {
@@ -1851,7 +2130,6 @@ impl PasswordChecker {
                             full_match, unit, repeats
                         ));
                     }
-                    total_entropy = (total_entropy - 4.0).max(1.0);
                 }
                 SegmentKind::PreviousRepeat(s) => {
                     if self.emit_warnings {
@@ -1860,7 +2138,6 @@ impl PasswordChecker {
                             s
                         ));
                     }
-                    total_entropy = (total_entropy - 3.0).max(1.0);
                 }
                 SegmentKind::Sequence(s) => {
                     if self.emit_warnings {
